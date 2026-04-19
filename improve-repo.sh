@@ -39,6 +39,8 @@ STASHED=false
 LOOPS=1           # Number of full improve cycles
 RESEARCH_PASSES=3 # Research passes per loop (broad, deep, internal)
 AI_TIMEOUT="45m"  # Per-call wall-clock ceiling for claude/codex invocations
+BASE_BRANCH_OVERRIDE="" # Optional --base-branch value
+REMOTE_NAME=""    # Optional --remote value (auto-detected if empty)
 
 # Step tracking for summary
 STEP_RESULTS=()
@@ -77,12 +79,36 @@ elapsed_since() {
 }
 
 detect_base_branch() {
+    if [[ -n "$BASE_BRANCH_OVERRIDE" ]]; then
+        if ! git -C "$REPO_PATH" rev-parse --verify "refs/heads/${BASE_BRANCH_OVERRIDE}" &>/dev/null; then
+            error "--base-branch '${BASE_BRANCH_OVERRIDE}' does not exist in the repo"
+            exit 1
+        fi
+        BASE_BRANCH="$BASE_BRANCH_OVERRIDE"
+        return
+    fi
     if git -C "$REPO_PATH" rev-parse --verify refs/heads/main &>/dev/null; then
         BASE_BRANCH="main"
     elif git -C "$REPO_PATH" rev-parse --verify refs/heads/master &>/dev/null; then
         BASE_BRANCH="master"
     else
         BASE_BRANCH=$(git -C "$REPO_PATH" branch --show-current 2>/dev/null || echo "main")
+    fi
+}
+
+detect_remote() {
+    if [[ -n "$REMOTE_NAME" ]]; then
+        if ! git -C "$REPO_PATH" remote get-url "$REMOTE_NAME" &>/dev/null; then
+            error "--remote '$REMOTE_NAME' is not configured in the repo"
+            exit 1
+        fi
+        return
+    fi
+    # Prefer origin, then first remote, else empty (PR step will error clearly)
+    if git -C "$REPO_PATH" remote get-url origin &>/dev/null; then
+        REMOTE_NAME="origin"
+    else
+        REMOTE_NAME=$(git -C "$REPO_PATH" remote | head -n1)
     fi
 }
 
@@ -177,6 +203,8 @@ OPTIONS:
     --loops N           Number of full improve cycles (default: 1, max: 5)
     --research-passes N Research depth per loop: 1=broad, 2=+deep, 3=+internal (default: 3)
     --timeout DURATION  Per-call ceiling for claude/codex (default: 45m; e.g. 2h, 90m)
+    --base-branch NAME  Override auto-detected base branch (default: main or master)
+    --remote NAME       Override push remote (default: auto-detect, prefers origin)
     --skip-research     Skip all research passes (use existing ROADMAP.md)
     --skip-implement    Skip implementation
     --skip-ux           Skip Codex UX pass
@@ -274,17 +302,22 @@ check_repo() {
 
     check_git_identity
 
-    # Auto-add .ai-improve-logs to .gitignore
+    # Auto-add .ai-improve-logs to .gitignore. Hooks are NOT bypassed — if a
+    # pre-commit hook rejects the change, that is signal, not an obstacle.
     if [[ -f "$REPO_PATH/.gitignore" ]]; then
         if ! grep -q "^\.ai-improve-logs" "$REPO_PATH/.gitignore" 2>/dev/null; then
             echo ".ai-improve-logs/" >> "$REPO_PATH/.gitignore"
             git -C "$REPO_PATH" add .gitignore
-            git -C "$REPO_PATH" commit -m "Add .ai-improve-logs to gitignore" --no-verify 2>/dev/null || true
-            info "Added .ai-improve-logs/ to .gitignore"
+            if git -C "$REPO_PATH" commit -m "Add .ai-improve-logs to gitignore" 2>/dev/null; then
+                info "Added .ai-improve-logs/ to .gitignore"
+            else
+                warn "Pre-commit hook blocked the .gitignore update — investigate before rerunning."
+            fi
         fi
     fi
 
     detect_base_branch
+    detect_remote
 
     # Handle uncommitted changes
     local dirty
@@ -604,8 +637,12 @@ do_audit() {
 _create_pr() {
     local findings="$1"
 
-    info "Pushing branch $BRANCH_NAME to origin..."
-    git -C "$REPO_PATH" push -u origin "$BRANCH_NAME" 2>&1
+    if [[ -z "$REMOTE_NAME" ]]; then
+        error "No git remote configured. Add one (git remote add origin <url>) or pass --remote."
+        return 1
+    fi
+    info "Pushing branch $BRANCH_NAME to $REMOTE_NAME..."
+    git -C "$REPO_PATH" push -u "$REMOTE_NAME" "$BRANCH_NAME" 2>&1
 
     local commit_log total_commits stats
     commit_log=$(git -C "$REPO_PATH" log --oneline "${BASE_BRANCH}..HEAD" 2>/dev/null || echo "no commits")
@@ -765,6 +802,8 @@ main() {
             --loops)          LOOPS="${2:?--loops requires a number}"; shift ;;
             --research-passes) RESEARCH_PASSES="${2:?--research-passes requires a number}"; shift ;;
             --timeout)        AI_TIMEOUT="${2:?--timeout requires a duration (e.g. 45m, 2h)}"; shift ;;
+            --base-branch)    BASE_BRANCH_OVERRIDE="${2:?--base-branch requires a branch name}"; shift ;;
+            --remote)         REMOTE_NAME="${2:?--remote requires a remote name}"; shift ;;
             --skip-research)  SKIP_RESEARCH=true ;;
             --skip-implement) SKIP_IMPLEMENT=true ;;
             --skip-ux)        SKIP_UX=true ;;
