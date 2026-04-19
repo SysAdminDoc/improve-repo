@@ -49,6 +49,15 @@ TOTAL_STEPS=0
 LOG_KEEP=10       # Retain the last N prior runs' logs; older get pruned
 CLEANUP_MODE=false # --cleanup: tear down orphaned run state instead of running the pipeline
 
+# Model overrides (empty = let the CLI pick its default)
+RESEARCH_MODEL=""
+IMPLEMENT_MODEL=""
+REVIEW_MODEL=""
+
+# Directory of prompt templates. External files override embedded defaults.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROMPTS_DIR="${IMPROVE_REPO_PROMPTS_DIR:-$SCRIPT_DIR/prompts}"
+
 # Exit handling state
 PIPELINE_CLEAN_EXIT=false
 
@@ -287,11 +296,14 @@ auto_commit_roadmap() {
 
 # Run claude with standard options. Exits non-zero if claude itself fails —
 # `tee` alone would mask the tool's exit code, so we use pipefail and inspect
-# PIPESTATUS[0] inside the subshell.
+# PIPESTATUS[0] inside the subshell. Optional 4th arg selects a model.
 run_claude() {
     local prompt="$1"
     local tools="${2:-Read Glob Grep Write Edit}"
     local log_file="$3"
+    local model="${4:-}"
+    local -a model_args=()
+    [[ -n "$model" ]] && model_args=(--model "$model")
 
     (
         set -o pipefail
@@ -299,6 +311,7 @@ run_claude() {
         timeout --foreground "$AI_TIMEOUT" claude -p "$prompt" \
             --allowedTools "$tools" \
             --permission-mode default \
+            "${model_args[@]}" \
             </dev/null \
             2>&1 | tee "$log_file"
         local rc=${PIPESTATUS[0]}
@@ -311,11 +324,13 @@ run_claude() {
     )
 }
 
-# Run codex exec with write access. Same pipefail + timeout + exit-code
-# propagation treatment as run_claude.
+# Run codex exec with write access. Optional 3rd arg selects a model.
 run_codex_exec() {
     local prompt="$1"
     local log_file="$2"
+    local model="${3:-}"
+    local -a model_args=()
+    [[ -n "$model" ]] && model_args=(-m "$model")
 
     (
         set -o pipefail
@@ -323,6 +338,7 @@ run_codex_exec() {
         timeout --foreground "$AI_TIMEOUT" codex exec \
             -c 'sandbox_permissions=["disk-full-read-access","disk-write-access"]' \
             -c 'approval_policy="auto-edit"' \
+            "${model_args[@]}" \
             "$prompt" \
             </dev/null \
             2>&1 | tee "$log_file"
@@ -334,6 +350,20 @@ run_codex_exec() {
         fi
         return "$rc"
     )
+}
+
+# Load a prompt template by name. External file in $PROMPTS_DIR wins over the
+# embedded default. External prompts can use {{TOKEN}} placeholders (expanded
+# via envsubst-style sed) for loop-aware content.
+load_prompt() {
+    local name="$1"
+    local external="$PROMPTS_DIR/${name}.md"
+    if [[ -f "$external" ]]; then
+        cat "$external"
+        return 0
+    fi
+    # Fall back to the function-scoped default embedded at the call site.
+    return 1
 }
 
 usage() {
@@ -352,6 +382,10 @@ OPTIONS:
     --remote NAME       Override push remote (default: auto-detect, prefers origin)
     --keep-logs N       Retain the last N prior runs' logs (default: 10)
     --cleanup           Tear down orphaned run state (lock, branches, logs) and exit
+    --research-model M  Override claude model for research phases
+    --implement-model M Override claude model for implementation phase
+    --review-model M    Override codex model for UX polish + audit
+    --prompts-dir DIR   Use custom prompt templates (default: $SCRIPT_DIR/prompts)
     --skip-research     Skip all research passes (use existing ROADMAP.md)
     --skip-implement    Skip implementation
     --skip-ux           Skip Codex UX pass
@@ -555,10 +589,17 @@ Write the updated ROADMAP.md. No other files.'
         return
     fi
 
+    # External prompt override wins over embedded default
+    local external
+    if external=$(load_prompt "research-pass-1"); then
+        prompt="$external"
+    fi
+
     info "Claude is scanning competitors (pass 1)..."
     run_claude "$prompt" \
         "Bash(git:*) Read Glob Grep WebSearch mcp__github__search_repositories mcp__github__get_file_contents Write Edit" \
-        "$LOG_DIR/research-L${loop_num}-P1-${TIMESTAMP}.log"
+        "$LOG_DIR/research-L${loop_num}-P1-${TIMESTAMP}.log" \
+        "$RESEARCH_MODEL"
 
     auto_commit_roadmap "ROADMAP.md: broad competitor scan (loop ${loop_num})"
     step_done "Research P1" "$(roadmap_counts)"
@@ -590,10 +631,16 @@ Write the updated ROADMAP.md. No other files.'
         return
     fi
 
+    local external
+    if external=$(load_prompt "research-pass-2"); then
+        prompt="$external"
+    fi
+
     info "Claude is doing deep competitor analysis (pass 2)..."
     run_claude "$prompt" \
         "Bash(git:*) Read Glob Grep WebSearch mcp__github__search_repositories mcp__github__get_file_contents mcp__github__list_issues Write Edit" \
-        "$LOG_DIR/research-L${loop_num}-P2-${TIMESTAMP}.log"
+        "$LOG_DIR/research-L${loop_num}-P2-${TIMESTAMP}.log" \
+        "$RESEARCH_MODEL"
 
     auto_commit_roadmap "ROADMAP.md: deep competitor dive (loop ${loop_num})"
     step_done "Research P2" "$(roadmap_counts)"
@@ -629,10 +676,16 @@ Write the updated ROADMAP.md. No other files.'
         return
     fi
 
+    local external
+    if external=$(load_prompt "research-pass-3"); then
+        prompt="$external"
+    fi
+
     info "Claude is auditing internal code quality (pass 3)..."
     run_claude "$prompt" \
         "Bash(git:*) Read Glob Grep Write Edit" \
-        "$LOG_DIR/research-L${loop_num}-P3-${TIMESTAMP}.log"
+        "$LOG_DIR/research-L${loop_num}-P3-${TIMESTAMP}.log" \
+        "$RESEARCH_MODEL"
 
     auto_commit_roadmap "ROADMAP.md: internal code audit (loop ${loop_num})"
     step_done "Research P3" "$(roadmap_counts)"
@@ -675,10 +728,16 @@ If there are no ${priority} items (or all are DONE), implement the top 3 items f
         return
     fi
 
+    local external
+    if external=$(load_prompt "implement"); then
+        prompt="$external"
+    fi
+
     info "Claude is implementing ${priority} roadmap items..."
     run_claude "$prompt" \
         "Bash(git:*) Bash(npm:*) Bash(npx:*) Bash(pnpm:*) Bash(cargo:*) Bash(python:*) Bash(pip:*) Bash(gradle:*) Read Glob Grep Write Edit" \
-        "$LOG_DIR/implement-L${loop_num}-${priority}-${TIMESTAMP}.log"
+        "$LOG_DIR/implement-L${loop_num}-${priority}-${TIMESTAMP}.log" \
+        "$IMPLEMENT_MODEL"
 
     local commits_after new_commits stats
     commits_after=$(commit_count)
@@ -726,8 +785,13 @@ Make direct edits. Commit each fix separately. Do NOT add new features."
     local commits_before commits_after new_commits
     commits_before=$(commit_count)
 
+    local external
+    if external=$(load_prompt "ux-polish"); then
+        prompt="$external"
+    fi
+
     info "Codex is polishing UX on ${file_count} files..."
-    run_codex_exec "$prompt" "$LOG_DIR/ux-L${loop_num}-${TIMESTAMP}.log"
+    run_codex_exec "$prompt" "$LOG_DIR/ux-L${loop_num}-${TIMESTAMP}.log" "$REVIEW_MODEL"
 
     commits_after=$(commit_count)
     new_commits=$(( commits_after - commits_before ))
@@ -753,10 +817,13 @@ do_audit() {
     local log_file="$LOG_DIR/audit-L${loop_num}-${TIMESTAMP}.log"
 
     info "Codex is reviewing all changes against ${BASE_BRANCH}..."
+    local -a review_model_args=()
+    [[ -n "$REVIEW_MODEL" ]] && review_model_args=(-m "$REVIEW_MODEL")
     (
         set -o pipefail
         cd "$REPO_PATH"
         timeout --foreground "$AI_TIMEOUT" codex review --base "$BASE_BRANCH" \
+            "${review_model_args[@]}" \
             </dev/null \
             2>&1 | tee "$log_file"
         local rc=${PIPESTATUS[0]}
@@ -801,22 +868,20 @@ _create_pr() {
         loop_desc=" (${LOOPS} loops, ${RESEARCH_PASSES} research passes each)"
     fi
 
-    info "Creating pull request..."
-    local pr_url
-    pr_url=$(
-        cd "$REPO_PATH"
-        gh pr create \
-            --title "AI Improvement: ${REPO_NAME} $(date +%Y-%m-%d)" \
-            --body "$(cat <<EOF
+    # Compose PR body. If the target repo defines a template, prepend it so
+    # its checklist items survive; the pipeline summary follows.
+    local pr_body pr_template="$REPO_PATH/.github/PULL_REQUEST_TEMPLATE.md"
+    local pipeline_body
+    pipeline_body=$(cat <<EOF
 ## Multi-AI Improvement Pipeline${loop_desc}
 
 **${total_commits} commits** | ${stats}
 
 ### Pipeline
-- **Claude** - ${RESEARCH_PASSES}-pass research (broad scan + deep dive + internal audit)
-- **Claude** - Implemented roadmap items
-- **Codex** - UX polish pass
-- **Codex** - Code review (${findings} findings)
+- ${RESEARCH_PASSES}-pass research (broad scan + deep dive + internal audit)
+- Implemented roadmap items
+- UX polish pass
+- Code review (${findings} findings)
 
 ### Commits
 \`\`\`
@@ -829,7 +894,21 @@ ${commit_log}
 - [ ] Test the changes locally
 - [ ] Merge or cherry-pick individual commits
 EOF
-            )" \
+)
+    if [[ -f "$pr_template" ]]; then
+        pr_body="$(cat "$pr_template")"$'\n\n---\n\n'"$pipeline_body"
+        info "Using repo PR template: $pr_template"
+    else
+        pr_body="$pipeline_body"
+    fi
+
+    info "Creating pull request..."
+    local pr_url
+    pr_url=$(
+        cd "$REPO_PATH"
+        gh pr create \
+            --title "AI Improvement: ${REPO_NAME} $(date +%Y-%m-%d)" \
+            --body "$pr_body" \
             --base "$BASE_BRANCH" 2>&1
     )
 
@@ -953,6 +1032,10 @@ main() {
             --remote)         REMOTE_NAME="${2:?--remote requires a remote name}"; shift ;;
             --keep-logs)      LOG_KEEP="${2:?--keep-logs requires a count}"; shift ;;
             --cleanup)        CLEANUP_MODE=true ;;
+            --research-model) RESEARCH_MODEL="${2:?--research-model requires a model name}"; shift ;;
+            --implement-model) IMPLEMENT_MODEL="${2:?--implement-model requires a model name}"; shift ;;
+            --review-model)   REVIEW_MODEL="${2:?--review-model requires a model name}"; shift ;;
+            --prompts-dir)    PROMPTS_DIR="${2:?--prompts-dir requires a path}"; shift ;;
             --skip-research)  SKIP_RESEARCH=true ;;
             --skip-implement) SKIP_IMPLEMENT=true ;;
             --skip-ux)        SKIP_UX=true ;;
