@@ -35,6 +35,7 @@ SKIP_PR=false
 STASHED=false
 LOOPS=1           # Number of full improve cycles
 RESEARCH_PASSES=3 # Research passes per loop (broad, deep, internal)
+AI_TIMEOUT="45m"  # Per-call wall-clock ceiling for claude/codex invocations
 
 # Step tracking for summary
 STEP_RESULTS=()
@@ -110,35 +111,54 @@ auto_commit_roadmap() {
     fi
 }
 
-# Run claude with standard options
+# Run claude with standard options. Exits non-zero if claude itself fails —
+# `tee` alone would mask the tool's exit code, so we use pipefail and inspect
+# PIPESTATUS[0] inside the subshell.
 run_claude() {
     local prompt="$1"
     local tools="${2:-Read Glob Grep Write Edit}"
     local log_file="$3"
 
     (
+        set -o pipefail
         cd "$REPO_PATH"
-        claude -p "$prompt" \
+        timeout --foreground "$AI_TIMEOUT" claude -p "$prompt" \
             --allowedTools "$tools" \
             --permission-mode default \
             </dev/null \
             2>&1 | tee "$log_file"
+        local rc=${PIPESTATUS[0]}
+        if (( rc == 124 )); then
+            error "claude timed out after $AI_TIMEOUT"
+        elif (( rc != 0 )); then
+            error "claude exited with code $rc"
+        fi
+        return "$rc"
     )
 }
 
-# Run codex exec with write access
+# Run codex exec with write access. Same pipefail + timeout + exit-code
+# propagation treatment as run_claude.
 run_codex_exec() {
     local prompt="$1"
     local log_file="$2"
 
     (
+        set -o pipefail
         cd "$REPO_PATH"
-        codex exec \
+        timeout --foreground "$AI_TIMEOUT" codex exec \
             -c 'sandbox_permissions=["disk-full-read-access","disk-write-access"]' \
             -c 'approval_policy="auto-edit"' \
             "$prompt" \
             </dev/null \
             2>&1 | tee "$log_file"
+        local rc=${PIPESTATUS[0]}
+        if (( rc == 124 )); then
+            error "codex timed out after $AI_TIMEOUT"
+        elif (( rc != 0 )); then
+            error "codex exited with code $rc"
+        fi
+        return "$rc"
     )
 }
 
@@ -153,6 +173,7 @@ USAGE:
 OPTIONS:
     --loops N           Number of full improve cycles (default: 1, max: 5)
     --research-passes N Research depth per loop: 1=broad, 2=+deep, 3=+internal (default: 3)
+    --timeout DURATION  Per-call ceiling for claude/codex (default: 45m; e.g. 2h, 90m)
     --skip-research     Skip all research passes (use existing ROADMAP.md)
     --skip-implement    Skip implementation
     --skip-ux           Skip Codex UX pass
@@ -532,10 +553,17 @@ do_audit() {
 
     info "Codex is reviewing all changes against ${BASE_BRANCH}..."
     (
+        set -o pipefail
         cd "$REPO_PATH"
-        codex review --base "$BASE_BRANCH" \
+        timeout --foreground "$AI_TIMEOUT" codex review --base "$BASE_BRANCH" \
             </dev/null \
             2>&1 | tee "$log_file"
+        local rc=${PIPESTATUS[0]}
+        if (( rc == 124 )); then
+            error "codex review timed out after $AI_TIMEOUT"
+        elif (( rc != 0 )); then
+            warn  "codex review exited with code $rc (continuing to PR step)"
+        fi
     )
 
     local findings
@@ -715,6 +743,7 @@ main() {
         case "$1" in
             --loops)          LOOPS="${2:?--loops requires a number}"; shift ;;
             --research-passes) RESEARCH_PASSES="${2:?--research-passes requires a number}"; shift ;;
+            --timeout)        AI_TIMEOUT="${2:?--timeout requires a duration (e.g. 45m, 2h)}"; shift ;;
             --skip-research)  SKIP_RESEARCH=true ;;
             --skip-implement) SKIP_IMPLEMENT=true ;;
             --skip-ux)        SKIP_UX=true ;;
