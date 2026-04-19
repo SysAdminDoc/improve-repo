@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file. Format foll
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-04-19
+
+### Added
+- `prompts/*.md` — phase prompt templates with embedded fallbacks. `--prompts-dir` / `$IMPROVE_REPO_PROMPTS_DIR` redirect to custom directories.
+- `prompts/profiles/*.md` — stack-specific guidance auto-appended to research prompts. Initial set: android, python, node, chrome-extension, userscript, rust, powershell, dotnet.
+- `--research-model`, `--implement-model`, `--review-model` — per-phase model overrides passed through to `claude` and `codex`.
+- `--max-retries N` + `--retry-backoff S` — exponential backoff on transient AI failures. Timeouts never retry.
+- `--quiet` / `--json` — output modes for CI and scripting contexts.
+- `--resume` — picks the newest `.ai-improve-logs/state-<ts>.txt` and skips phases already logged as completed. Each phase writes a checkpoint on success.
+- `--pause-after-research` — interactive gate before implementation so `ROADMAP.md` can be hand-edited. TTY-only; ignored under `--json`/`--quiet`/`--dry-run`.
+- `--cleanup` — tears down orphaned locks, `ai-improve/*` branches, and rotates logs without running the pipeline.
+- `ROADMAP-SCHEMA.md` — documents the strict format the pipeline reads and writes.
+- Summary file — `.ai-improve-logs/summary-${TIMESTAMP}.md` persists the run receipt.
+- OS notification on finish — `notify-send` / `osascript` / PowerShell beep with terminal-bell fallback.
+- Cost reporting — best-effort parse of input/output tokens and USD markers from call logs; surfaced in summary and JSON.
+- PR-template detection — if target repo has `.github/PULL_REQUEST_TEMPLATE.md`, its body is prepended to the pipeline summary in the PR body.
+
+### Changed
+- Model refusals (rate limits, context overflow, policy blocks) now detected via log-tail grep and surfaced with exit code 2 instead of reporting success.
+- `roadmap_counts` now uses a structured awk parser; priority strings in description cells no longer trip the counter. Reports `DONE:<n>` when shipped work exists.
+- Research prompts (both external templates and embedded fallbacks) now spec the ROADMAP schema explicitly so models don't drift to bullet lists.
+
 ## [3.1.0] - 2026-04-19
 
 ### Fixed

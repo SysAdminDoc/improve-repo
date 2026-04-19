@@ -6,7 +6,7 @@
 
 **Automated repository improvement pipeline — research, implement, polish, review, PR.**
 
-[![Version](https://img.shields.io/badge/version-3.1.0-blue.svg)](https://github.com/SysAdminDoc/improve-repo/releases)
+[![Version](https://img.shields.io/badge/version-3.2.0-blue.svg)](https://github.com/SysAdminDoc/improve-repo/releases)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows--bash-lightgrey.svg)](#requirements)
 [![Shell](https://img.shields.io/badge/shell-bash-89e051.svg)](improve-repo.sh)
@@ -54,18 +54,29 @@ chmod +x improve-repo.sh
 improve-repo.sh <repo-path-or-name> [OPTIONS]
 
 OPTIONS:
-  --loops N            Number of full cycles (default: 1, max: 5)
-  --research-passes N  Research depth: 1=broad, 2=+deep, 3=+internal (default: 3)
-  --timeout DURATION   Per-call ceiling for claude/codex (default: 45m)
-  --base-branch NAME   Override auto-detected base branch (main/master)
-  --remote NAME        Override push remote (default: origin)
-  --keep-logs N        Retain last N prior runs' logs (default: 10)
-  --skip-research      Reuse existing ROADMAP.md
-  --skip-implement     Skip implementation
-  --skip-ux            Skip UX polish pass
-  --skip-audit         Skip code review
-  --skip-pr            Run locally; do not push or open a PR
-  --dry-run            Print planned steps without running
+  --loops N                Number of full cycles (default: 1, max: 5)
+  --research-passes N      Research depth: 1=broad, 2=+deep, 3=+internal (default: 3)
+  --timeout DURATION       Per-call ceiling for claude/codex (default: 45m)
+  --base-branch NAME       Override auto-detected base branch (main/master)
+  --remote NAME            Override push remote (default: origin)
+  --keep-logs N            Retain last N prior runs' logs (default: 10)
+  --max-retries N          Retry transient AI failures N times (default: 2)
+  --retry-backoff S        Base seconds for exponential backoff (default: 10)
+  --research-model M       Claude model for research phases
+  --implement-model M      Claude model for implementation
+  --review-model M         Codex model for UX + audit
+  --prompts-dir DIR        Override prompt template directory
+  --resume                 Resume the most recent incomplete run
+  --pause-after-research   Gate before implementation so ROADMAP.md can be hand-edited
+  --quiet                  Suppress info output (warn/error still print)
+  --json                   Emit single-line JSON summary instead of the table
+  --cleanup                Tear down orphaned run state and exit
+  --skip-research          Reuse existing ROADMAP.md
+  --skip-implement         Skip implementation
+  --skip-ux                Skip UX polish pass
+  --skip-audit             Skip code review
+  --skip-pr                Run locally; do not push or open a PR
+  --dry-run                Print planned steps without running
 ```
 
 ### Examples

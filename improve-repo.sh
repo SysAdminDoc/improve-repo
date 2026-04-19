@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# improve-repo.sh v3.1.0
+# improve-repo.sh v3.2.0
 # Multi-AI repo improvement pipeline with multi-pass research and iterative loops
 # Usage: ./improve-repo.sh <repo-path> [OPTIONS]
 
@@ -576,7 +576,7 @@ _retry_sleep() {
 
 usage() {
     cat <<'EOF'
-improve-repo.sh v3.1.0 - Multi-AI repo improvement pipeline
+improve-repo.sh v3.2.0 - Multi-AI repo improvement pipeline
 
 USAGE:
     ./improve-repo.sh <repo-path> [OPTIONS]
