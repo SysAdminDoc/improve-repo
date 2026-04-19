@@ -43,6 +43,7 @@ BASE_BRANCH_OVERRIDE="" # Optional --base-branch value
 REMOTE_NAME=""    # Optional --remote value (auto-detected if empty)
 MAX_RETRIES=2     # Retries on transient claude/codex failure (3 total attempts)
 RETRY_BACKOFF=10  # Seconds base for exponential backoff (10, 30, 90...)
+OUTPUT_MODE="human" # "human" (default), "quiet" (warn/error only), or "json"
 
 # Step tracking for summary
 STEP_RESULTS=()
@@ -64,17 +65,31 @@ PROMPTS_DIR="${IMPROVE_REPO_PROMPTS_DIR:-$SCRIPT_DIR/prompts}"
 PIPELINE_CLEAN_EXIT=false
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
-info()    { echo -e "${BLUE}[INFO]${RESET} $*"; }
-success() { echo -e "${GREEN}[DONE]${RESET} $*"; }
-warn()    { echo -e "${YELLOW}[WARN]${RESET} $*"; }
+# info/success are silenced in --quiet and --json modes; warn/error always print.
+info()    { [[ "$OUTPUT_MODE" == "human" ]] && echo -e "${BLUE}[INFO]${RESET} $*" || true; }
+success() { [[ "$OUTPUT_MODE" == "human" ]] && echo -e "${GREEN}[DONE]${RESET} $*" || true; }
+warn()    { echo -e "${YELLOW}[WARN]${RESET} $*" >&2; }
 error()   { echo -e "${RED}[ERROR]${RESET} $*" >&2; }
+
+# Escape a string for JSON encoding (quotes, backslashes, control chars).
+_json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
 
 step() {
     STEP_COUNTER=$(( STEP_COUNTER + 1 ))
     local step_start
     step_start=$(date +%s)
-    echo -e "\n${MAGENTA}${BOLD}=== STEP ${STEP_COUNTER}/${TOTAL_STEPS}: $1 ===${RESET}"
-    echo -e "${DIM}    Started $(date '+%H:%M:%S')${RESET}\n"
+    if [[ "$OUTPUT_MODE" == "human" ]]; then
+        echo -e "\n${MAGENTA}${BOLD}=== STEP ${STEP_COUNTER}/${TOTAL_STEPS}: $1 ===${RESET}"
+        echo -e "${DIM}    Started $(date '+%H:%M:%S')${RESET}\n"
+    fi
     export _STEP_START="$step_start"
 }
 
@@ -291,6 +306,47 @@ _count_priority() {
     ' "$REPO_PATH/ROADMAP.md" 2>/dev/null
 }
 
+# Detect repo stack(s) by looking for telltale files. Returns a space-separated
+# list of type tokens that correspond to prompts/profiles/<type>.md files.
+detect_repo_type() {
+    local -a types=()
+    local r="$REPO_PATH"
+    [[ -f "$r/build.gradle.kts" || -f "$r/build.gradle" ]] && types+=("android")
+    [[ -f "$r/pyproject.toml" || -f "$r/setup.py" || -f "$r/requirements.txt" ]] && types+=("python")
+    [[ -f "$r/Cargo.toml" ]] && types+=("rust")
+    [[ -f "$r/package.json" ]] && types+=("node")
+    [[ -f "$r/manifest.json" ]] && grep -q '"manifest_version"' "$r/manifest.json" 2>/dev/null \
+        && types+=("chrome-extension")
+    compgen -G "$r/*.user.js" >/dev/null 2>&1 && types+=("userscript")
+    compgen -G "$r/*.ps1" >/dev/null 2>&1 && types+=("powershell")
+    compgen -G "$r/*.csproj" >/dev/null 2>&1 && types+=("dotnet")
+    compgen -G "$r/*.sln" >/dev/null 2>&1 && types+=("dotnet")
+    # Deduplicate via associative array
+    declare -A seen
+    local out=""
+    for t in "${types[@]}"; do
+        [[ -n "${seen[$t]:-}" ]] && continue
+        seen[$t]=1
+        out+="$t "
+    done
+    echo "${out% }"
+}
+
+# Concatenate profile addenda for all detected types. Empty if none match.
+_load_profile_addendum() {
+    local -a types
+    read -r -a types <<< "$(detect_repo_type)"
+    local addendum=""
+    for t in "${types[@]}"; do
+        local f="$PROMPTS_DIR/profiles/${t}.md"
+        if [[ -f "$f" ]]; then
+            addendum+=$'\n\n--- Stack profile: '"$t"$' ---\n'
+            addendum+=$(cat "$f")
+        fi
+    done
+    [[ -n "$addendum" ]] && echo "$addendum"
+}
+
 roadmap_counts() {
     [[ -f "$REPO_PATH/ROADMAP.md" ]] || { echo "P1:0 P2:0 P3:0"; return; }
     local p1 p2 p3 done
@@ -459,6 +515,8 @@ OPTIONS:
     --prompts-dir DIR   Use custom prompt templates (default: $SCRIPT_DIR/prompts)
     --max-retries N     Retry transient AI failures N times (default: 2, so 3 attempts)
     --retry-backoff S   Base seconds for exponential backoff (default: 10 -> 10, 30, 90)
+    --quiet             Suppress info/success output; warn/error still print
+    --json              Emit machine-readable JSON summary instead of the table
     --skip-research     Skip all research passes (use existing ROADMAP.md)
     --skip-implement    Skip implementation
     --skip-ux           Skip Codex UX pass
@@ -668,6 +726,10 @@ Write the updated ROADMAP.md. No other files.'
     if external=$(load_prompt "research-pass-1"); then
         prompt="$external"
     fi
+    # Append stack-specific profile addendum (if any profiles match the repo)
+    local addendum
+    addendum=$(_load_profile_addendum)
+    [[ -n "$addendum" ]] && prompt="${prompt}${addendum}"
 
     info "Claude is scanning competitors (pass 1)..."
     run_claude "$prompt" \
@@ -754,6 +816,9 @@ Write the updated ROADMAP.md. No other files.'
     if external=$(load_prompt "research-pass-3"); then
         prompt="$external"
     fi
+    local addendum
+    addendum=$(_load_profile_addendum)
+    [[ -n "$addendum" ]] && prompt="${prompt}${addendum}"
 
     info "Claude is auditing internal code quality (pass 3)..."
     run_claude "$prompt" \
@@ -1032,8 +1097,16 @@ run_loop() {
 
 # ── Summary Report ──────────────────────────────────────────────────────────
 print_summary() {
-    local total_elapsed
+    local total_elapsed total_commits stats
     total_elapsed=$(elapsed_since "$PIPELINE_START")
+    total_commits=$(commit_count)
+    stats=$(diff_stats)
+
+    if [[ "$OUTPUT_MODE" == "json" ]]; then
+        _print_summary_json "$total_elapsed" "$total_commits" "$stats"
+        return
+    fi
+    [[ "$OUTPUT_MODE" == "quiet" ]] && return
 
     echo ""
     echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════╗${RESET}"
@@ -1052,9 +1125,6 @@ print_summary() {
     done
     echo ""
 
-    local total_commits stats
-    total_commits=$(commit_count)
-    stats=$(diff_stats)
     echo -e "  ${BOLD}Total:${RESET}   ${total_commits} commits | ${stats}"
     echo -e "  ${BOLD}Loops:${RESET}   ${LOOPS} (${RESEARCH_PASSES} research passes each)"
     echo -e "  ${BOLD}Time:${RESET}    ${total_elapsed}"
@@ -1072,14 +1142,57 @@ print_summary() {
     echo ""
 }
 
+_print_summary_json() {
+    local total_elapsed="$1" total_commits="$2" stats="$3"
+    local roadmap=""
+    [[ -f "$REPO_PATH/ROADMAP.md" ]] && roadmap=$(roadmap_counts)
+
+    # Build steps array
+    local steps_json="" first=true
+    for result in "${STEP_RESULTS[@]}"; do
+        local step_name detail time_str
+        step_name=$(_json_escape "$(echo "$result" | cut -d'|' -f1)")
+        detail=$(_json_escape   "$(echo "$result" | cut -d'|' -f2)")
+        time_str=$(_json_escape "$(echo "$result" | cut -d'|' -f3)")
+        $first || steps_json+=","
+        first=false
+        steps_json+="{\"name\":\"$step_name\",\"time\":\"$time_str\",\"result\":\"$detail\"}"
+    done
+
+    printf '{"repo":"%s","branch":"%s","base":"%s","loops":%d,"research_passes":%d,"time":"%s","commits":%d,"stats":"%s","roadmap":"%s","log_dir":"%s","stashed":%s,"steps":[%s]}\n' \
+        "$(_json_escape "$REPO_NAME")" \
+        "$(_json_escape "$BRANCH_NAME")" \
+        "$(_json_escape "$BASE_BRANCH")" \
+        "$LOOPS" \
+        "$RESEARCH_PASSES" \
+        "$(_json_escape "$total_elapsed")" \
+        "$total_commits" \
+        "$(_json_escape "$stats")" \
+        "$(_json_escape "$roadmap")" \
+        "$(_json_escape "$LOG_DIR")" \
+        "$($STASHED && echo true || echo false)" \
+        "$steps_json"
+}
+
 # ── Main ────────────────────────────────────────────────────────────────────
 main() {
-    echo -e "${CYAN}${BOLD}"
-    echo "  ╔══════════════════════════════════════════════════╗"
-    echo "  ║   Multi-AI Repo Improvement Pipeline v3.1        ║"
-    echo "  ║   Claude x3 Research -> Implement -> Codex Loop  ║"
-    echo "  ╚══════════════════════════════════════════════════╝"
-    echo -e "${RESET}"
+    # Parse --quiet/--json early so the banner can be suppressed. Peek through
+    # argv without consuming — the real parser runs below.
+    for a in "$@"; do
+        case "$a" in
+            --quiet) OUTPUT_MODE="quiet" ;;
+            --json)  OUTPUT_MODE="json"  ;;
+        esac
+    done
+
+    if [[ "$OUTPUT_MODE" == "human" ]]; then
+        echo -e "${CYAN}${BOLD}"
+        echo "  ╔══════════════════════════════════════════════════╗"
+        echo "  ║   Multi-AI Repo Improvement Pipeline v3.2        ║"
+        echo "  ║   Claude x3 Research -> Implement -> Codex Loop  ║"
+        echo "  ╚══════════════════════════════════════════════════╝"
+        echo -e "${RESET}"
+    fi
 
     if [[ $# -lt 1 ]] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
         usage
@@ -1112,6 +1225,8 @@ main() {
             --prompts-dir)    PROMPTS_DIR="${2:?--prompts-dir requires a path}"; shift ;;
             --max-retries)    MAX_RETRIES="${2:?--max-retries requires a count}"; shift ;;
             --retry-backoff)  RETRY_BACKOFF="${2:?--retry-backoff requires seconds}"; shift ;;
+            --quiet)          OUTPUT_MODE="quiet" ;;
+            --json)           OUTPUT_MODE="json" ;;
             --skip-research)  SKIP_RESEARCH=true ;;
             --skip-implement) SKIP_IMPLEMENT=true ;;
             --skip-ux)        SKIP_UX=true ;;
