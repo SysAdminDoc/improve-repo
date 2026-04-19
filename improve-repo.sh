@@ -47,6 +47,7 @@ STEP_RESULTS=()
 STEP_COUNTER=0
 TOTAL_STEPS=0
 LOG_KEEP=10       # Retain the last N prior runs' logs; older get pruned
+CLEANUP_MODE=false # --cleanup: tear down orphaned run state instead of running the pipeline
 
 # Exit handling state
 PIPELINE_CLEAN_EXIT=false
@@ -116,6 +117,110 @@ rotate_logs() {
         rm -f "${old[@]}"
         info "Rotated ${#old[@]} old log file(s) (kept newest $LOG_KEEP)"
     fi
+}
+
+# Fire a best-effort OS notification when the pipeline finishes. Falls back
+# through platform-specific channels, ending at a terminal bell.
+notify_complete() {
+    local title="improve-repo"
+    local msg="${1:-pipeline complete}"
+    case "$OSTYPE" in
+        linux*)
+            command -v notify-send >/dev/null 2>&1 && notify-send "$title" "$msg" 2>/dev/null || true
+            ;;
+        darwin*)
+            command -v osascript >/dev/null 2>&1 && \
+                osascript -e "display notification \"$msg\" with title \"$title\"" 2>/dev/null || true
+            ;;
+        msys*|cygwin*|win32)
+            # Git Bash on Windows — PowerShell toast via BurntToast isn't
+            # guaranteed, so just play the system exclamation sound.
+            command -v powershell.exe >/dev/null 2>&1 && \
+                powershell.exe -NoProfile -Command "[System.Media.SystemSounds]::Exclamation.Play()" 2>/dev/null || true
+            ;;
+    esac
+    # Terminal bell as universal fallback — costs nothing, never fails.
+    printf '\a' >&2
+}
+
+# Persist the human-readable summary to disk so closed terminals don't lose it.
+write_summary_file() {
+    local summary_file="$LOG_DIR/summary-${TIMESTAMP}.md"
+    local total_commits stats total_elapsed
+    total_commits=$(commit_count)
+    stats=$(diff_stats)
+    total_elapsed=$(elapsed_since "$PIPELINE_START")
+
+    {
+        echo "# improve-repo summary — ${REPO_NAME}"
+        echo ""
+        echo "- **Date:** $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "- **Branch:** \`${BRANCH_NAME}\`"
+        echo "- **Base:** \`${BASE_BRANCH}\`"
+        echo "- **Loops:** ${LOOPS} (${RESEARCH_PASSES} research passes each)"
+        echo "- **Time:** ${total_elapsed}"
+        echo "- **Commits:** ${total_commits} | ${stats}"
+        [[ -f "$REPO_PATH/ROADMAP.md" ]] && echo "- **Roadmap:** $(roadmap_counts)"
+        echo ""
+        echo "## Steps"
+        echo ""
+        echo "| Step | Time | Result |"
+        echo "| ---- | ---- | ------ |"
+        for result in "${STEP_RESULTS[@]}"; do
+            local step_name detail time_str
+            step_name=$(echo "$result" | cut -d'|' -f1)
+            detail=$(echo "$result"  | cut -d'|' -f2)
+            time_str=$(echo "$result" | cut -d'|' -f3)
+            echo "| $step_name | $time_str | $detail |"
+        done
+    } > "$summary_file"
+
+    info "Summary written: $summary_file"
+}
+
+# --cleanup: tear down leftover state from an aborted run (lock, branch, stash,
+# logs). Inverse of the pipeline; safe to invoke on a clean repo (no-op).
+do_cleanup() {
+    local current_branch stash_count
+    info "Cleanup mode for: $REPO_NAME ($REPO_PATH)"
+
+    # 1. Remove stale lock directory
+    if [[ -d "$LOG_DIR/.lock" ]]; then
+        rm -rf "$LOG_DIR/.lock"
+        success "Removed stale lock directory"
+    fi
+
+    # 2. Delete all ai-improve/* feature branches (user must have merged or
+    #    abandoned them — we don't guess).
+    current_branch=$(git -C "$REPO_PATH" branch --show-current 2>/dev/null || echo "")
+    if [[ "$current_branch" == ai-improve/* ]]; then
+        warn "Currently on $current_branch — switch off it first:"
+        warn "  git -C '$REPO_PATH' checkout $BASE_BRANCH"
+        return 1
+    fi
+    local -a branches
+    mapfile -t branches < <(git -C "$REPO_PATH" branch --list 'ai-improve/*' | sed 's/^[ *]*//')
+    if (( ${#branches[@]} > 0 )); then
+        for b in "${branches[@]}"; do
+            git -C "$REPO_PATH" branch -D "$b" 2>&1 | head -1
+        done
+        success "Deleted ${#branches[@]} ai-improve/* branch(es)"
+    else
+        info "No ai-improve/* branches to delete"
+    fi
+
+    # 3. Surface (but don't silently pop) any leftover auto-stash
+    stash_count=$(git -C "$REPO_PATH" stash list | grep -c 'ai-improve: auto-stash' || true)
+    if (( stash_count > 0 )); then
+        warn "$stash_count auto-stash entry/entries remain. Inspect with:"
+        warn "  git -C '$REPO_PATH' stash list"
+        warn "Restore manually with: git -C '$REPO_PATH' stash pop"
+    fi
+
+    # 4. Prune logs down to --keep-logs N (default 10)
+    rotate_logs
+
+    success "Cleanup complete"
 }
 
 detect_base_branch() {
@@ -246,6 +351,7 @@ OPTIONS:
     --base-branch NAME  Override auto-detected base branch (default: main or master)
     --remote NAME       Override push remote (default: auto-detect, prefers origin)
     --keep-logs N       Retain the last N prior runs' logs (default: 10)
+    --cleanup           Tear down orphaned run state (lock, branches, logs) and exit
     --skip-research     Skip all research passes (use existing ROADMAP.md)
     --skip-implement    Skip implementation
     --skip-ux           Skip Codex UX pass
@@ -846,6 +952,7 @@ main() {
             --base-branch)    BASE_BRANCH_OVERRIDE="${2:?--base-branch requires a branch name}"; shift ;;
             --remote)         REMOTE_NAME="${2:?--remote requires a remote name}"; shift ;;
             --keep-logs)      LOG_KEEP="${2:?--keep-logs requires a count}"; shift ;;
+            --cleanup)        CLEANUP_MODE=true ;;
             --skip-research)  SKIP_RESEARCH=true ;;
             --skip-implement) SKIP_IMPLEMENT=true ;;
             --skip-ux)        SKIP_UX=true ;;
@@ -883,6 +990,14 @@ main() {
     check_tools
     check_repo
     rotate_logs
+
+    # --cleanup: tear down and exit before touching the feature branch
+    if $CLEANUP_MODE; then
+        do_cleanup
+        PIPELINE_CLEAN_EXIT=true
+        return 0
+    fi
+
     prepare_feature_branch
 
     info "Target:   $REPO_NAME ($REPO_PATH)"
@@ -901,6 +1016,8 @@ main() {
     done
 
     print_summary
+    write_summary_file
+    notify_complete "finished in $(elapsed_since "$PIPELINE_START")"
     PIPELINE_CLEAN_EXIT=true
 }
 
