@@ -41,6 +41,8 @@ RESEARCH_PASSES=3 # Research passes per loop (broad, deep, internal)
 AI_TIMEOUT="45m"  # Per-call wall-clock ceiling for claude/codex invocations
 BASE_BRANCH_OVERRIDE="" # Optional --base-branch value
 REMOTE_NAME=""    # Optional --remote value (auto-detected if empty)
+MAX_RETRIES=2     # Retries on transient claude/codex failure (3 total attempts)
+RETRY_BACKOFF=10  # Seconds base for exponential backoff (10, 30, 90...)
 
 # Step tracking for summary
 STEP_RESULTS=()
@@ -294,9 +296,10 @@ auto_commit_roadmap() {
     fi
 }
 
-# Run claude with standard options. Exits non-zero if claude itself fails —
-# `tee` alone would mask the tool's exit code, so we use pipefail and inspect
-# PIPESTATUS[0] inside the subshell. Optional 4th arg selects a model.
+# Run claude with standard options. Retries on transient failure with
+# exponential backoff, never retries timeouts, and inspects the log for
+# refusal / context-limit signatures post-success.
+# Returns 0 on success, 2 on refusal, 124 on timeout, otherwise claude's rc.
 run_claude() {
     local prompt="$1"
     local tools="${2:-Read Glob Grep Write Edit}"
@@ -305,26 +308,40 @@ run_claude() {
     local -a model_args=()
     [[ -n "$model" ]] && model_args=(--model "$model")
 
-    (
-        set -o pipefail
-        cd "$REPO_PATH"
-        timeout --foreground "$AI_TIMEOUT" claude -p "$prompt" \
-            --allowedTools "$tools" \
-            --permission-mode default \
-            "${model_args[@]}" \
-            </dev/null \
-            2>&1 | tee "$log_file"
-        local rc=${PIPESTATUS[0]}
+    local attempt=0 rc=0
+    while (( attempt <= MAX_RETRIES )); do
+        (
+            set -o pipefail
+            cd "$REPO_PATH"
+            timeout --foreground "$AI_TIMEOUT" claude -p "$prompt" \
+                --allowedTools "$tools" \
+                --permission-mode default \
+                "${model_args[@]}" \
+                </dev/null \
+                2>&1 | tee "$log_file"
+            exit "${PIPESTATUS[0]}"
+        )
+        rc=$?
+        if (( rc == 0 )); then
+            if _detect_refusal "$log_file"; then
+                error "claude appears to have refused or hit a limit (see $log_file)"
+                return 2
+            fi
+            return 0
+        fi
         if (( rc == 124 )); then
             error "claude timed out after $AI_TIMEOUT"
-        elif (( rc != 0 )); then
-            error "claude exited with code $rc"
+            return 124
         fi
-        return "$rc"
-    )
+        attempt=$(( attempt + 1 ))
+        (( attempt > MAX_RETRIES )) && break
+        _retry_sleep "$attempt" "$RETRY_BACKOFF" "claude"
+    done
+    error "claude failed (rc=$rc) after $MAX_RETRIES retries"
+    return "$rc"
 }
 
-# Run codex exec with write access. Optional 3rd arg selects a model.
+# Run codex exec with write access. Same retry + refusal handling as run_claude.
 run_codex_exec() {
     local prompt="$1"
     local log_file="$2"
@@ -332,24 +349,38 @@ run_codex_exec() {
     local -a model_args=()
     [[ -n "$model" ]] && model_args=(-m "$model")
 
-    (
-        set -o pipefail
-        cd "$REPO_PATH"
-        timeout --foreground "$AI_TIMEOUT" codex exec \
-            -c 'sandbox_permissions=["disk-full-read-access","disk-write-access"]' \
-            -c 'approval_policy="auto-edit"' \
-            "${model_args[@]}" \
-            "$prompt" \
-            </dev/null \
-            2>&1 | tee "$log_file"
-        local rc=${PIPESTATUS[0]}
+    local attempt=0 rc=0
+    while (( attempt <= MAX_RETRIES )); do
+        (
+            set -o pipefail
+            cd "$REPO_PATH"
+            timeout --foreground "$AI_TIMEOUT" codex exec \
+                -c 'sandbox_permissions=["disk-full-read-access","disk-write-access"]' \
+                -c 'approval_policy="auto-edit"' \
+                "${model_args[@]}" \
+                "$prompt" \
+                </dev/null \
+                2>&1 | tee "$log_file"
+            exit "${PIPESTATUS[0]}"
+        )
+        rc=$?
+        if (( rc == 0 )); then
+            if _detect_refusal "$log_file"; then
+                warn "codex appears to have refused or hit a limit (see $log_file)"
+                return 2
+            fi
+            return 0
+        fi
         if (( rc == 124 )); then
             error "codex timed out after $AI_TIMEOUT"
-        elif (( rc != 0 )); then
-            error "codex exited with code $rc"
+            return 124
         fi
-        return "$rc"
-    )
+        attempt=$(( attempt + 1 ))
+        (( attempt > MAX_RETRIES )) && break
+        _retry_sleep "$attempt" "$RETRY_BACKOFF" "codex"
+    done
+    error "codex failed (rc=$rc) after $MAX_RETRIES retries"
+    return "$rc"
 }
 
 # Load a prompt template by name. External file in $PROMPTS_DIR wins over the
@@ -364,6 +395,25 @@ load_prompt() {
     fi
     # Fall back to the function-scoped default embedded at the call site.
     return 1
+}
+
+# Scan the last ~50 lines of a log file for known refusal / context-limit
+# signatures. Returns 0 if a refusal pattern was found, 1 otherwise.
+_detect_refusal() {
+    local log_file="$1"
+    [[ -f "$log_file" ]] || return 1
+    tail -n 50 "$log_file" 2>/dev/null | grep -iEq \
+        'rate limit|too many requests|context (length|window) (exceeded|overflow)|maximum context|token limit exceeded|i (can.?t|cannot) (help|assist|do that)|i am not able to|refused|policy (violation|restriction)' \
+        && return 0
+    return 1
+}
+
+# Sleep with a message before a retry. Exponential: base * 3^(attempt-1).
+_retry_sleep() {
+    local attempt="$1" base="$2" cmd="$3"
+    local s=$(( base * (3 ** (attempt - 1)) ))
+    warn "$cmd failed transiently. Retry $attempt/$MAX_RETRIES in ${s}s..."
+    sleep "$s"
 }
 
 usage() {
@@ -386,6 +436,8 @@ OPTIONS:
     --implement-model M Override claude model for implementation phase
     --review-model M    Override codex model for UX polish + audit
     --prompts-dir DIR   Use custom prompt templates (default: $SCRIPT_DIR/prompts)
+    --max-retries N     Retry transient AI failures N times (default: 2, so 3 attempts)
+    --retry-backoff S   Base seconds for exponential backoff (default: 10 -> 10, 30, 90)
     --skip-research     Skip all research passes (use existing ROADMAP.md)
     --skip-implement    Skip implementation
     --skip-ux           Skip Codex UX pass
@@ -1036,6 +1088,8 @@ main() {
             --implement-model) IMPLEMENT_MODEL="${2:?--implement-model requires a model name}"; shift ;;
             --review-model)   REVIEW_MODEL="${2:?--review-model requires a model name}"; shift ;;
             --prompts-dir)    PROMPTS_DIR="${2:?--prompts-dir requires a path}"; shift ;;
+            --max-retries)    MAX_RETRIES="${2:?--max-retries requires a count}"; shift ;;
+            --retry-backoff)  RETRY_BACKOFF="${2:?--retry-backoff requires seconds}"; shift ;;
             --skip-research)  SKIP_RESEARCH=true ;;
             --skip-implement) SKIP_IMPLEMENT=true ;;
             --skip-ux)        SKIP_UX=true ;;
