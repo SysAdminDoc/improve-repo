@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="logo.png" alt="improve-repo" width="160" />
+
 # improve-repo
 
 **Automated repository improvement pipeline — research, implement, polish, review, PR.**
