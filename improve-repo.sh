@@ -19,8 +19,11 @@ RESET='\033[0m'
 
 # ── Config ──────────────────────────────────────────────────────────────────
 BRANCH_PREFIX="ai-improve"
-TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+# Uniqueness: seconds + PID + RANDOM. Cross-platform (GNU date's %N isn't
+# portable to macOS). Two fast invocations can no longer collide.
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}"
 BRANCH_NAME="${BRANCH_PREFIX}/${TIMESTAMP}"
+LOCK_DIR=""
 LOG_DIR=""
 REPO_PATH=""
 REPO_NAME=""
@@ -259,6 +262,16 @@ check_repo() {
     LOG_DIR="$REPO_PATH/.ai-improve-logs"
     mkdir -p "$LOG_DIR"
 
+    # Atomic mutex against concurrent invocations on the same repo. mkdir is
+    # atomic on every POSIX filesystem, so this portably stands in for flock.
+    LOCK_DIR="$LOG_DIR/.lock"
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        error "Another improve-repo run appears to be active on '$REPO_NAME'."
+        error "  Lock: $LOCK_DIR"
+        error "  If you're sure no run is in progress: rm -rf '$LOCK_DIR'"
+        exit 1
+    fi
+
     check_git_identity
 
     # Auto-add .ai-improve-logs to .gitignore
@@ -291,6 +304,22 @@ check_repo() {
     fi
 
     success "Repository: $REPO_NAME (base: $BASE_BRANCH)"
+}
+
+# Create (or resume) the ai-improve feature branch BEFORE research begins.
+# Previously the branch was created only at implementation time, so research
+# passes' ROADMAP.md auto-commits landed on the base branch — colliding with
+# branch protection and polluting main's history.
+prepare_feature_branch() {
+    local current_branch
+    current_branch=$(git -C "$REPO_PATH" branch --show-current 2>/dev/null || echo "")
+    if [[ "$current_branch" == ai-improve/* ]]; then
+        BRANCH_NAME="$current_branch"
+        info "Resuming on branch: $BRANCH_NAME"
+    else
+        info "Creating branch: $BRANCH_NAME"
+        git -C "$REPO_PATH" checkout -b "$BRANCH_NAME"
+    fi
 }
 
 # ── Research Passes ────────────────────────────────────────────────────────
@@ -441,16 +470,8 @@ do_implement() {
         return 1
     fi
 
-    # Create or reuse feature branch
-    local current_branch
-    current_branch=$(git -C "$REPO_PATH" branch --show-current)
-    if [[ "$current_branch" == ai-improve/* ]]; then
-        BRANCH_NAME="$current_branch"
-        info "On branch: $BRANCH_NAME"
-    else
-        info "Creating branch: $BRANCH_NAME"
-        git -C "$REPO_PATH" checkout -b "$BRANCH_NAME"
-    fi
+    # Branch is prepared up-front in main(); just confirm.
+    info "On branch: $BRANCH_NAME"
 
     local commits_before
     commits_before=$(commit_count)
@@ -777,13 +798,7 @@ main() {
 
     check_tools
     check_repo
-
-    # Reuse existing ai-improve branch
-    local current_branch
-    current_branch=$(git -C "$REPO_PATH" branch --show-current 2>/dev/null)
-    if [[ "$current_branch" == ai-improve/* ]]; then
-        BRANCH_NAME="$current_branch"
-    fi
+    prepare_feature_branch
 
     info "Target:   $REPO_NAME ($REPO_PATH)"
     info "Branch:   $BRANCH_NAME"
