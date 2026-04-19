@@ -276,12 +276,33 @@ diff_stats() {
     git -C "$REPO_PATH" diff --shortstat "${BASE_BRANCH}..HEAD" 2>/dev/null || echo "no changes"
 }
 
+# Structured parser: counts rows where column 2 of a markdown pipe-table is
+# exactly a priority code. Immune to priority strings appearing inside
+# description cells (see ROADMAP-SCHEMA.md).
+_count_priority() {
+    local prio="$1"
+    awk -F'|' -v p="$prio" '
+        NF>=3 {
+            # Trim whitespace from column 2
+            v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+            if (v == p) n++
+        }
+        END { print n+0 }
+    ' "$REPO_PATH/ROADMAP.md" 2>/dev/null
+}
+
 roadmap_counts() {
-    local p1 p2 p3
-    p1=$(grep -c '| P1 ' "$REPO_PATH/ROADMAP.md" 2>/dev/null | tr -d '[:space:]')
-    p2=$(grep -c '| P2 ' "$REPO_PATH/ROADMAP.md" 2>/dev/null | tr -d '[:space:]')
-    p3=$(grep -c '| P3 ' "$REPO_PATH/ROADMAP.md" 2>/dev/null | tr -d '[:space:]')
-    echo "P1:${p1:-0} P2:${p2:-0} P3:${p3:-0}"
+    [[ -f "$REPO_PATH/ROADMAP.md" ]] || { echo "P1:0 P2:0 P3:0"; return; }
+    local p1 p2 p3 done
+    p1=$(_count_priority "P1")
+    p2=$(_count_priority "P2")
+    p3=$(_count_priority "P3")
+    done=$(_count_priority "DONE")
+    if (( done > 0 )); then
+        echo "P1:${p1} P2:${p2} P3:${p3} DONE:${done}"
+    else
+        echo "P1:${p1} P2:${p2} P3:${p3}"
+    fi
 }
 
 # Auto-commit ROADMAP.md if dirty
@@ -608,11 +629,12 @@ do_research_pass_1() {
 
 3. Generate or update ROADMAP.md with:
    - "## Competitor Analysis" — table of competitors found
-   - "## Improvement Backlog" — prioritized items:
-     - P1: Quick wins, clear value, < 1 hour each
-     - P2: Medium features users expect, 1-4 hours
-     - P3: Nice-to-haves and polish
-   - Each item: priority, title, one-line description, which competitor inspired it
+   - "## Improvement Backlog" — prioritized items in this EXACT schema:
+     | Priority | Title | Description | Source |
+     | -------- | ----- | ----------- | ------ |
+     | P1 | Title | One-line description. | competitor or internal |
+     Priority column MUST be exactly P1, P2, P3, or DONE. Nothing else.
+     P1=quick wins <1h, P2=medium features 1-4h, P3=polish.
    - "## UX Improvements" — specific UI/UX issues found
 
 4. Focus on PRACTICAL improvements only. Skip anything requiring external APIs, paid services, or special hardware.

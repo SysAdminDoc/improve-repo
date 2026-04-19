@@ -9,11 +9,16 @@ You are analyzing this repository to find improvement opportunities.
 
 3. Generate or update ROADMAP.md with:
    - "## Competitor Analysis" — table of competitors found
-   - "## Improvement Backlog" — prioritized items:
-     - P1: Quick wins, clear value, < 1 hour each
-     - P2: Medium features users expect, 1-4 hours
-     - P3: Nice-to-haves and polish
-   - Each item: priority, title, one-line description, which competitor inspired it
+   - "## Improvement Backlog" — prioritized items in this EXACT schema:
+     ```
+     | Priority | Title | Description | Source |
+     | -------- | ----- | ----------- | ------ |
+     | P1 | Title | One-line description. | competitor-name or internal |
+     ```
+     Priority column values MUST be exactly one of: P1, P2, P3, DONE.
+     P1 = quick wins (< 1 hour each)
+     P2 = medium features users expect (1-4 hours)
+     P3 = nice-to-haves and polish
    - "## UX Improvements" — specific UI/UX issues found
 
 4. Focus on PRACTICAL improvements only. Skip anything requiring external APIs, paid services, or special hardware.
