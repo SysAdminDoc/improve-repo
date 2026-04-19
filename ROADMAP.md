@@ -24,6 +24,24 @@ Seed backlog for `improve-repo` itself. Format is the same schema the pipeline p
 | P3       | Parallel research passes           | Pass 1 (broad) and Pass 3 (internal audit) are independent. Run concurrently, join before Pass 2.                                                      | internal   |
 | P3       | Improved error propagation         | Use `PIPESTATUS` throughout and bubble meaningful exit codes to the loop driver so `set -e` can actually catch failures.                               | internal   |
 | P3       | Per-phase `--help`                 | Expand usage to document each phase's inputs/outputs so users can reason about `--skip-*` combinations.                                                | internal   |
+| P1       | Signal trap for cleanup            | Ctrl-C mid-run leaves the stash, feature branch, and partial commits orphaned. `print_summary` never fires on abort. Add `trap cleanup INT TERM ERR`.    | internal   |
+| P1       | Concurrency lockfile               | `TIMESTAMP=$(date +%Y%m%d-%H%M%S)` has second resolution — two fast invocations collide on branch name, stash slot, and ROADMAP. Flock-gate via `.ai-improve-logs/.lock` and use nanosecond timestamps. | internal   |
+| P1       | Git identity preflight             | If `user.email`/`user.name` are unset, the pipeline fails 10 minutes in at first commit. Check `git config user.email` next to `check_tools`.          | internal   |
+| P1       | `--remote` override                | `git push -u origin "$BRANCH_NAME"` hardcodes `origin`. Detect the remote or expose `--remote` for repos using `upstream`/custom names.                | internal   |
+| P1       | Remove `--no-verify` from auto-commit | `.gitignore` auto-commit bypasses hooks, violating the rule the tool itself flags in audits. Drop `--no-verify` and let hooks run.                   | internal   |
+| P1       | Bash 4+ version guard              | Script uses features that break on macOS default bash 3.2. Add `((BASH_VERSINFO[0] < 4))` guard with a clear error.                                    | internal   |
+| P2       | `--cleanup` subcommand             | Tear down an aborted run: delete the feature branch, restore the stash, prune logs. Pairs with trap-based cleanup.                                     | internal   |
+| P2       | OS notification on completion      | Long pipelines (20+ min) deserve a finish signal. Terminal bell + `notify-send`/`osascript`/PowerShell toast by platform.                              | internal   |
+| P2       | Persist summary to file            | `print_summary` only hits stdout. Also write `.ai-improve-logs/summary-${TIMESTAMP}.md` so closed terminals don't lose the receipt.                    | internal   |
+| P2       | Retry + backoff on API errors      | A single rate-limit or 5xx from claude/codex kills a 30-minute run. Wrap calls with bounded exponential retry.                                         | internal   |
+| P2       | Model refusal detection            | If the model refuses or hits context limits, the pipeline reports success and moves on. Grep logs for refusal signatures and surface them.             | internal   |
+| P2       | `--model` override per phase       | Different phases want different models (Haiku for broad scan, Opus for implementation). Expose `--research-model`/`--implement-model`.                 | internal   |
+| P2       | Repo-type profile files            | Generic prompts produce generic output. Detect stack (`build.gradle.kts`, `pyproject.toml`, `manifest.json`) and load `profiles/<type>.md`.            | internal   |
+| P2       | `--json` / `--quiet` output        | Machine-readable mode for CI and scripting. Emit structured phase results and summary.                                                                 | internal   |
+| P3       | Input validation on `<repo-path>`  | Reject paths starting with `-` and validate `[[ -d "$REPO_PATH" ]]` before any expansion. Defense-in-depth on shell metachars.                         | internal   |
+| P3       | Per-invocation log size ceiling    | Even with rotation across runs, a single runaway loop can bloat `.ai-improve-logs/` unbounded. Cap per-invocation.                                     | internal   |
+| P3       | Path-with-spaces sweep             | Most `"$REPO_PATH"` usages quote correctly, but a full audit is overdue — Git Bash on Windows will find the gaps.                                      | internal   |
+| P3       | Minimum version pins               | `claude`, `codex`, `gh` all ship breaking changes. Probe `--version` against known-good minima in preflight and warn on drift.                         | internal   |
 
 ## Internal Audit
 
@@ -34,6 +52,11 @@ Findings backing the P1/P2 items above.
 - **Auth drift** — `claude` and `codex` tokens expire silently. The pipeline invests minutes in Pass 1 only to fail at implementation with no preserved state.
 - **Format coupling** — Roadmap progress reporting (`roadmap_counts`) and implementation selection (`do_implement` prompt: "items that are NOT already marked as DONE") both depend on the model producing a specific markdown shape. A schema removes the fragility.
 - **Log sprawl** — Every run writes N logs per loop. Over weeks, `.ai-improve-logs/` becomes the largest directory in the repo.
+- **Abort recovery gap** — No `trap` handler. Ctrl-C strands the stash, the partial branch, and whatever state the in-flight phase was mutating. The user-facing "you have stashed changes" reminder only runs on clean exit.
+- **Concurrency races** — Second-resolution timestamps plus no lockfile means two simultaneous invocations on the same repo step on each other's branch names, stash, and roadmap commits.
+- **Hook bypass self-foul** — The `.gitignore` auto-commit uses `--no-verify`, which is precisely the anti-pattern the tool would call out when auditing someone else's script.
+- **Prompt genericness** — The same prompts target Python libs, Android apps, Chrome extensions, and C++ desktop apps. Most of the "missing features" the model surfaces are plumbing advice rather than stack-specific insight.
+- **Silent model refusals** — When `claude` or `codex` refuses (context, safety, ambiguity) the pipeline reports success. Post-run roadmap counts will look fine while zero actual implementation happened.
 
 ## Done
 
