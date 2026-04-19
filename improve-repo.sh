@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
-# improve-repo.sh v3.0.0
+# improve-repo.sh v3.1.0
 # Multi-AI repo improvement pipeline with multi-pass research and iterative loops
 # Usage: ./improve-repo.sh <repo-path> [OPTIONS]
 
 set -euo pipefail
+
+# Require bash 4+ (macOS default bash 3.2 lacks features used here)
+if (( BASH_VERSINFO[0] < 4 )); then
+    echo "[ERROR] bash 4.0+ required (found ${BASH_VERSION})." >&2
+    echo "        On macOS: brew install bash && exec /opt/homebrew/bin/bash $0 \"\$@\"" >&2
+    exit 1
+fi
 
 # ── Colors ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
@@ -180,15 +187,45 @@ EOF
 
 check_tools() {
     local missing=()
-    command -v claude >/dev/null 2>&1 || missing+=("claude")
-    command -v codex  >/dev/null 2>&1 || missing+=("codex")
-    command -v gh     >/dev/null 2>&1 || missing+=("gh")
+    command -v claude  >/dev/null 2>&1 || missing+=("claude")
+    command -v codex   >/dev/null 2>&1 || missing+=("codex")
+    command -v gh      >/dev/null 2>&1 || missing+=("gh")
+    command -v git     >/dev/null 2>&1 || missing+=("git")
+    command -v timeout >/dev/null 2>&1 || missing+=("timeout (coreutils)")
 
     if [[ ${#missing[@]} -gt 0 ]]; then
         error "Missing required tools: ${missing[*]}"
         exit 1
     fi
-    success "All tools available (claude, codex, gh)"
+
+    # Version probes — surfaces stale auth and broken installs early, before
+    # the pipeline invests minutes in research only to fail at implementation.
+    if ! claude --version >/dev/null 2>&1; then
+        error "'claude --version' failed. Is the CLI installed and authenticated?"
+        exit 1
+    fi
+    if ! codex --version >/dev/null 2>&1; then
+        error "'codex --version' failed. Is the CLI installed and authenticated?"
+        exit 1
+    fi
+    if ! gh auth status >/dev/null 2>&1; then
+        error "'gh auth status' failed. Run: gh auth login"
+        exit 1
+    fi
+
+    success "All tools available (claude, codex, gh, git, timeout)"
+}
+
+check_git_identity() {
+    local email name
+    email=$(git -C "$REPO_PATH" config user.email 2>/dev/null || true)
+    name=$(git -C "$REPO_PATH" config user.name  2>/dev/null || true)
+    if [[ -z "$email" || -z "$name" ]]; then
+        error "git user.email and user.name must be set in the target repo."
+        error "  git -C '$REPO_PATH' config user.email 'you@example.com'"
+        error "  git -C '$REPO_PATH' config user.name  'Your Name'"
+        exit 1
+    fi
 }
 
 check_repo() {
@@ -200,6 +237,8 @@ check_repo() {
     REPO_NAME=$(basename "$REPO_PATH")
     LOG_DIR="$REPO_PATH/.ai-improve-logs"
     mkdir -p "$LOG_DIR"
+
+    check_git_identity
 
     # Auto-add .ai-improve-logs to .gitignore
     if [[ -f "$REPO_PATH/.gitignore" ]]; then
