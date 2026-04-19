@@ -1,0 +1,19 @@
+# AI agent working files (local only)
+CLAUDE.md
+CODEX_CHANGELOG.md
+.ai-improve-logs/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
