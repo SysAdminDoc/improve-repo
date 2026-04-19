@@ -46,6 +46,10 @@ REMOTE_NAME=""    # Optional --remote value (auto-detected if empty)
 STEP_RESULTS=()
 STEP_COUNTER=0
 TOTAL_STEPS=0
+LOG_KEEP=10       # Retain the last N prior runs' logs; older get pruned
+
+# Exit handling state
+PIPELINE_CLEAN_EXIT=false
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 info()    { echo -e "${BLUE}[INFO]${RESET} $*"; }
@@ -76,6 +80,42 @@ elapsed_since() {
     local mins=$(( elapsed / 60 ))
     local secs=$(( elapsed % 60 ))
     echo "${mins}m ${secs}s"
+}
+
+# Invoked via trap on EXIT/INT/TERM. Releases the lock, then — only on abort —
+# prints the recovery hint the user would otherwise have to piece together.
+cleanup_on_exit() {
+    local rc=$?
+    [[ -n "$LOCK_DIR" && -d "$LOCK_DIR" ]] && rm -rf "$LOCK_DIR"
+
+    if ! $PIPELINE_CLEAN_EXIT; then
+        echo "" >&2
+        warn "Pipeline aborted (exit $rc). Recovery hints:"
+        if [[ -n "$BRANCH_NAME" && -n "$REPO_PATH" ]] && \
+           git -C "$REPO_PATH" rev-parse --verify "$BRANCH_NAME" &>/dev/null; then
+            echo "    Branch:     $BRANCH_NAME (inspect with: git -C '$REPO_PATH' log $BRANCH_NAME)" >&2
+            echo "    Drop it:    git -C '$REPO_PATH' branch -D '$BRANCH_NAME'" >&2
+        fi
+        if $STASHED; then
+            echo "    Stash:      git -C '$REPO_PATH' stash pop" >&2
+        fi
+        if [[ -n "$LOG_DIR" && -d "$LOG_DIR" ]]; then
+            echo "    Logs:       $LOG_DIR/" >&2
+        fi
+    fi
+}
+
+# Prune older per-run log files, keeping the most recent $LOG_KEEP runs.
+# Uses ls -t (portable across GNU + BSD) rather than find -printf (GNU-only).
+rotate_logs() {
+    [[ -d "$LOG_DIR" ]] || return 0
+    local -a files old
+    mapfile -t files < <(ls -1t "$LOG_DIR"/*.log 2>/dev/null || true)
+    if (( ${#files[@]} > LOG_KEEP )); then
+        old=("${files[@]:$LOG_KEEP}")
+        rm -f "${old[@]}"
+        info "Rotated ${#old[@]} old log file(s) (kept newest $LOG_KEEP)"
+    fi
 }
 
 detect_base_branch() {
@@ -205,6 +245,7 @@ OPTIONS:
     --timeout DURATION  Per-call ceiling for claude/codex (default: 45m; e.g. 2h, 90m)
     --base-branch NAME  Override auto-detected base branch (default: main or master)
     --remote NAME       Override push remote (default: auto-detect, prefers origin)
+    --keep-logs N       Retain the last N prior runs' logs (default: 10)
     --skip-research     Skip all research passes (use existing ROADMAP.md)
     --skip-implement    Skip implementation
     --skip-ux           Skip Codex UX pass
@@ -804,6 +845,7 @@ main() {
             --timeout)        AI_TIMEOUT="${2:?--timeout requires a duration (e.g. 45m, 2h)}"; shift ;;
             --base-branch)    BASE_BRANCH_OVERRIDE="${2:?--base-branch requires a branch name}"; shift ;;
             --remote)         REMOTE_NAME="${2:?--remote requires a remote name}"; shift ;;
+            --keep-logs)      LOG_KEEP="${2:?--keep-logs requires a count}"; shift ;;
             --skip-research)  SKIP_RESEARCH=true ;;
             --skip-implement) SKIP_IMPLEMENT=true ;;
             --skip-ux)        SKIP_UX=true ;;
@@ -835,8 +877,12 @@ main() {
 
     PIPELINE_START=$(date +%s)
 
+    # Register cleanup BEFORE any state-mutating work so aborts are recoverable.
+    trap cleanup_on_exit EXIT INT TERM
+
     check_tools
     check_repo
+    rotate_logs
     prepare_feature_branch
 
     info "Target:   $REPO_NAME ($REPO_PATH)"
@@ -855,6 +901,7 @@ main() {
     done
 
     print_summary
+    PIPELINE_CLEAN_EXIT=true
 }
 
 main "$@"
