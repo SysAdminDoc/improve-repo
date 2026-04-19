@@ -44,6 +44,9 @@ REMOTE_NAME=""    # Optional --remote value (auto-detected if empty)
 MAX_RETRIES=2     # Retries on transient claude/codex failure (3 total attempts)
 RETRY_BACKOFF=10  # Seconds base for exponential backoff (10, 30, 90...)
 OUTPUT_MODE="human" # "human" (default), "quiet" (warn/error only), or "json"
+RESUME_MODE=false # --resume: skip phases that are already logged as completed
+PAUSE_AFTER_RESEARCH=false # --pause-after-research: gate before implementation
+STATE_FILE=""     # Set after LOG_DIR is known
 
 # Step tracking for summary
 STEP_RESULTS=()
@@ -306,6 +309,84 @@ _count_priority() {
     ' "$REPO_PATH/ROADMAP.md" 2>/dev/null
 }
 
+# ── Resume / checkpoint ─────────────────────────────────────────────────────
+# State is a flat list of completed phase keys, one per line, in
+# .ai-improve-logs/state-<timestamp>.txt. `--resume` picks the newest state file
+# in LOG_DIR and skips any phase whose key is present.
+
+_state_key() {
+    # "research-L${loop}-P${n}", "implement-L${loop}-${prio}", etc. — match the
+    # log-file naming scheme so the two stay aligned.
+    echo "$1"
+}
+
+state_mark_done() {
+    local key="$1"
+    [[ -n "$STATE_FILE" ]] || return 0
+    echo "$key" >> "$STATE_FILE"
+}
+
+state_is_done() {
+    local key="$1"
+    [[ -n "$STATE_FILE" && -f "$STATE_FILE" ]] || return 1
+    grep -Fxq "$key" "$STATE_FILE"
+}
+
+_find_latest_state_file() {
+    [[ -d "$LOG_DIR" ]] || return 1
+    ls -1t "$LOG_DIR"/state-*.txt 2>/dev/null | head -n1
+}
+
+# Resolve resume: find latest state file, derive TIMESTAMP/BRANCH_NAME from it.
+# Does nothing if --resume wasn't passed.
+maybe_resume() {
+    $RESUME_MODE || { STATE_FILE="$LOG_DIR/state-${TIMESTAMP}.txt"; return 0; }
+    local latest
+    latest=$(_find_latest_state_file || echo "")
+    if [[ -z "$latest" ]]; then
+        warn "--resume requested but no prior state file found. Starting fresh."
+        STATE_FILE="$LOG_DIR/state-${TIMESTAMP}.txt"
+        return 0
+    fi
+    # Extract the timestamp from the state file name
+    local prior_ts
+    prior_ts=$(basename "$latest" .txt | sed 's/^state-//')
+    TIMESTAMP="$prior_ts"
+    BRANCH_NAME="${BRANCH_PREFIX}/${TIMESTAMP}"
+    STATE_FILE="$latest"
+    info "Resuming from: $STATE_FILE"
+    info "  Timestamp:  $TIMESTAMP"
+    info "  Branch:     $BRANCH_NAME"
+    info "  Completed:  $(wc -l < "$STATE_FILE" | tr -d '[:space:]') phase(s)"
+}
+
+# ── Cost reporting ──────────────────────────────────────────────────────────
+# Best-effort parse of claude/codex log files for token and USD markers. Format
+# varies by CLI version; if nothing matches we quietly report zero.
+
+COST_TOTAL_INPUT_TOKENS=0
+COST_TOTAL_OUTPUT_TOKENS=0
+COST_TOTAL_USD=0
+
+_aggregate_cost_from_log() {
+    local log="$1"
+    [[ -f "$log" ]] || return 0
+    # Try several common patterns. Grep returns empty on no match; the
+    # arithmetic below tolerates that.
+    local in_tok out_tok usd
+    in_tok=$(grep -oE '"input_tokens"[[:space:]]*:[[:space:]]*[0-9]+' "$log" 2>/dev/null \
+        | grep -oE '[0-9]+$' | awk '{s+=$1} END {print s+0}')
+    out_tok=$(grep -oE '"output_tokens"[[:space:]]*:[[:space:]]*[0-9]+' "$log" 2>/dev/null \
+        | grep -oE '[0-9]+$' | awk '{s+=$1} END {print s+0}')
+    usd=$(grep -oE '"(cost_usd|total_cost)"[[:space:]]*:[[:space:]]*[0-9]+(\.[0-9]+)?' "$log" 2>/dev/null \
+        | grep -oE '[0-9]+(\.[0-9]+)?$' | awk '{s+=$1} END {print s+0}')
+    COST_TOTAL_INPUT_TOKENS=$(( COST_TOTAL_INPUT_TOKENS + ${in_tok:-0} ))
+    COST_TOTAL_OUTPUT_TOKENS=$(( COST_TOTAL_OUTPUT_TOKENS + ${out_tok:-0} ))
+    # USD is floating point — accumulate with awk to avoid bash-only integer math
+    COST_TOTAL_USD=$(awk -v a="$COST_TOTAL_USD" -v b="${usd:-0}" 'BEGIN {printf "%.4f", a+b}')
+}
+
+# ── Repo-type profiles ──────────────────────────────────────────────────────
 # Detect repo stack(s) by looking for telltale files. Returns a space-separated
 # list of type tokens that correspond to prompts/profiles/<type>.md files.
 detect_repo_type() {
@@ -517,6 +598,8 @@ OPTIONS:
     --retry-backoff S   Base seconds for exponential backoff (default: 10 -> 10, 30, 90)
     --quiet             Suppress info/success output; warn/error still print
     --json              Emit machine-readable JSON summary instead of the table
+    --resume            Resume the most recent incomplete run (skip completed phases)
+    --pause-after-research  Pause before implementation so ROADMAP.md can be hand-edited
     --skip-research     Skip all research passes (use existing ROADMAP.md)
     --skip-implement    Skip implementation
     --skip-ux           Skip Codex UX pass
@@ -672,6 +755,12 @@ prepare_feature_branch() {
 
 do_research_pass_1() {
     local loop_num="$1"
+    local key="research-L${loop_num}-P1"
+    if state_is_done "$key"; then
+        info "Skipping $key (already completed — resuming)"
+        step_done "Research P1" "skipped (resume)"
+        return
+    fi
     step "RESEARCH Pass 1/${RESEARCH_PASSES} - Broad Competitor Scan (Loop ${loop_num})"
 
     local prompt
@@ -732,17 +821,26 @@ Write the updated ROADMAP.md. No other files.'
     [[ -n "$addendum" ]] && prompt="${prompt}${addendum}"
 
     info "Claude is scanning competitors (pass 1)..."
+    local log_file="$LOG_DIR/research-L${loop_num}-P1-${TIMESTAMP}.log"
     run_claude "$prompt" \
         "Bash(git:*) Read Glob Grep WebSearch mcp__github__search_repositories mcp__github__get_file_contents Write Edit" \
-        "$LOG_DIR/research-L${loop_num}-P1-${TIMESTAMP}.log" \
+        "$log_file" \
         "$RESEARCH_MODEL"
+    _aggregate_cost_from_log "$log_file"
 
     auto_commit_roadmap "ROADMAP.md: broad competitor scan (loop ${loop_num})"
+    state_mark_done "$key"
     step_done "Research P1" "$(roadmap_counts)"
 }
 
 do_research_pass_2() {
     local loop_num="$1"
+    local key="research-L${loop_num}-P2"
+    if state_is_done "$key"; then
+        info "Skipping $key (already completed — resuming)"
+        step_done "Research P2" "skipped (resume)"
+        return
+    fi
     step "RESEARCH Pass 2/${RESEARCH_PASSES} - Deep Dive (Loop ${loop_num})"
 
     local prompt
@@ -773,17 +871,26 @@ Write the updated ROADMAP.md. No other files.'
     fi
 
     info "Claude is doing deep competitor analysis (pass 2)..."
+    local log_file="$LOG_DIR/research-L${loop_num}-P2-${TIMESTAMP}.log"
     run_claude "$prompt" \
         "Bash(git:*) Read Glob Grep WebSearch mcp__github__search_repositories mcp__github__get_file_contents mcp__github__list_issues Write Edit" \
-        "$LOG_DIR/research-L${loop_num}-P2-${TIMESTAMP}.log" \
+        "$log_file" \
         "$RESEARCH_MODEL"
+    _aggregate_cost_from_log "$log_file"
 
     auto_commit_roadmap "ROADMAP.md: deep competitor dive (loop ${loop_num})"
+    state_mark_done "$key"
     step_done "Research P2" "$(roadmap_counts)"
 }
 
 do_research_pass_3() {
     local loop_num="$1"
+    local key="research-L${loop_num}-P3"
+    if state_is_done "$key"; then
+        info "Skipping $key (already completed — resuming)"
+        step_done "Research P3" "skipped (resume)"
+        return
+    fi
     step "RESEARCH Pass 3/${RESEARCH_PASSES} - Internal Code Review (Loop ${loop_num})"
 
     local prompt
@@ -821,12 +928,15 @@ Write the updated ROADMAP.md. No other files.'
     [[ -n "$addendum" ]] && prompt="${prompt}${addendum}"
 
     info "Claude is auditing internal code quality (pass 3)..."
+    local log_file="$LOG_DIR/research-L${loop_num}-P3-${TIMESTAMP}.log"
     run_claude "$prompt" \
         "Bash(git:*) Read Glob Grep Write Edit" \
-        "$LOG_DIR/research-L${loop_num}-P3-${TIMESTAMP}.log" \
+        "$log_file" \
         "$RESEARCH_MODEL"
+    _aggregate_cost_from_log "$log_file"
 
     auto_commit_roadmap "ROADMAP.md: internal code audit (loop ${loop_num})"
+    state_mark_done "$key"
     step_done "Research P3" "$(roadmap_counts)"
 }
 
@@ -834,6 +944,12 @@ Write the updated ROADMAP.md. No other files.'
 do_implement() {
     local loop_num="$1"
     local priority="${2:-P1}"
+    local key="implement-L${loop_num}-${priority}"
+    if state_is_done "$key"; then
+        info "Skipping $key (already completed — resuming)"
+        step_done "Implement" "skipped (resume)"
+        return
+    fi
     step "IMPLEMENT ${priority} items (Loop ${loop_num}, Claude)"
 
     if [[ ! -f "$REPO_PATH/ROADMAP.md" ]]; then
@@ -873,21 +989,30 @@ If there are no ${priority} items (or all are DONE), implement the top 3 items f
     fi
 
     info "Claude is implementing ${priority} roadmap items..."
+    local log_file="$LOG_DIR/implement-L${loop_num}-${priority}-${TIMESTAMP}.log"
     run_claude "$prompt" \
         "Bash(git:*) Bash(npm:*) Bash(npx:*) Bash(pnpm:*) Bash(cargo:*) Bash(python:*) Bash(pip:*) Bash(gradle:*) Read Glob Grep Write Edit" \
-        "$LOG_DIR/implement-L${loop_num}-${priority}-${TIMESTAMP}.log" \
+        "$log_file" \
         "$IMPLEMENT_MODEL"
+    _aggregate_cost_from_log "$log_file"
 
     local commits_after new_commits stats
     commits_after=$(commit_count)
     new_commits=$(( commits_after - commits_before ))
     stats=$(diff_stats)
+    state_mark_done "$key"
     step_done "Implement" "${new_commits} commits (${priority}), ${stats}"
 }
 
 # ── UX Polish (Codex) ─────────────────────────────────────────────────────
 do_ux() {
     local loop_num="$1"
+    local key="ux-L${loop_num}"
+    if state_is_done "$key"; then
+        info "Skipping $key (already completed — resuming)"
+        step_done "UX Polish" "skipped (resume)"
+        return
+    fi
     step "UX POLISH (Loop ${loop_num}, Codex)"
 
     local changed_files
@@ -930,11 +1055,14 @@ Make direct edits. Commit each fix separately. Do NOT add new features."
     fi
 
     info "Codex is polishing UX on ${file_count} files..."
-    run_codex_exec "$prompt" "$LOG_DIR/ux-L${loop_num}-${TIMESTAMP}.log" "$REVIEW_MODEL"
+    local log_file="$LOG_DIR/ux-L${loop_num}-${TIMESTAMP}.log"
+    run_codex_exec "$prompt" "$log_file" "$REVIEW_MODEL"
+    _aggregate_cost_from_log "$log_file"
 
     commits_after=$(commit_count)
     new_commits=$(( commits_after - commits_before ))
 
+    state_mark_done "$key"
     if [[ $new_commits -gt 0 ]]; then
         step_done "UX Polish" "${new_commits} commits by Codex"
     else
@@ -946,6 +1074,12 @@ Make direct edits. Commit each fix separately. Do NOT add new features."
 do_audit() {
     local loop_num="$1"
     local is_final="${2:-false}"
+    local key="audit-L${loop_num}"
+    if state_is_done "$key"; then
+        info "Skipping $key (already completed — resuming)"
+        step_done "Audit" "skipped (resume)"
+        return
+    fi
     step "CODE REVIEW (Loop ${loop_num}, Codex)"
 
     if $DRY_RUN; then
@@ -973,10 +1107,12 @@ do_audit() {
         fi
     )
 
+    _aggregate_cost_from_log "$log_file"
     local findings
     findings=$(grep -c '^\- \[P[0-9]\]' "$log_file" 2>/dev/null || echo "0")
     info "Codex found ${findings} review items"
 
+    state_mark_done "$key"
     # Only create PR on the final loop
     if [[ "$is_final" == "true" ]] && ! $SKIP_PR; then
         _create_pr "$findings"
@@ -1076,6 +1212,16 @@ run_loop() {
         [[ $RESEARCH_PASSES -ge 3 ]] && do_research_pass_3 "$loop_num"
     fi
 
+    # ── Optional pause between research and implementation ──
+    # Honor --pause-after-research only when stdin is a TTY. CI / --json /
+    # --quiet contexts skip this (no one to press Enter).
+    if $PAUSE_AFTER_RESEARCH && ! $DRY_RUN && [[ -t 0 ]] && [[ "$OUTPUT_MODE" == "human" ]]; then
+        echo ""
+        warn "Research complete. Review ROADMAP.md now (reorder, edit, drop items)."
+        warn "Press Enter to continue with implementation, or Ctrl-C to abort."
+        read -r _
+    fi
+
     # ── Implement ──
     if ! $SKIP_IMPLEMENT; then
         if [[ "$loop_num" -eq 1 ]]; then
@@ -1135,6 +1281,12 @@ print_summary() {
         echo -e "  ${BOLD}Roadmap:${RESET} $(roadmap_counts)"
     fi
 
+    # Cost line — only shown if we actually parsed something meaningful.
+    if (( COST_TOTAL_INPUT_TOKENS > 0 || COST_TOTAL_OUTPUT_TOKENS > 0 )) || \
+       awk "BEGIN { exit !($COST_TOTAL_USD > 0) }" 2>/dev/null; then
+        echo -e "  ${BOLD}Tokens:${RESET}  in=${COST_TOTAL_INPUT_TOKENS} out=${COST_TOTAL_OUTPUT_TOKENS} | USD ~\$${COST_TOTAL_USD}"
+    fi
+
     if $STASHED; then
         echo ""
         warn "You have stashed changes. Run: git -C '$REPO_PATH' stash pop"
@@ -1159,7 +1311,7 @@ _print_summary_json() {
         steps_json+="{\"name\":\"$step_name\",\"time\":\"$time_str\",\"result\":\"$detail\"}"
     done
 
-    printf '{"repo":"%s","branch":"%s","base":"%s","loops":%d,"research_passes":%d,"time":"%s","commits":%d,"stats":"%s","roadmap":"%s","log_dir":"%s","stashed":%s,"steps":[%s]}\n' \
+    printf '{"repo":"%s","branch":"%s","base":"%s","loops":%d,"research_passes":%d,"time":"%s","commits":%d,"stats":"%s","roadmap":"%s","log_dir":"%s","stashed":%s,"cost":{"input_tokens":%d,"output_tokens":%d,"usd":%s},"steps":[%s]}\n' \
         "$(_json_escape "$REPO_NAME")" \
         "$(_json_escape "$BRANCH_NAME")" \
         "$(_json_escape "$BASE_BRANCH")" \
@@ -1171,6 +1323,9 @@ _print_summary_json() {
         "$(_json_escape "$roadmap")" \
         "$(_json_escape "$LOG_DIR")" \
         "$($STASHED && echo true || echo false)" \
+        "$COST_TOTAL_INPUT_TOKENS" \
+        "$COST_TOTAL_OUTPUT_TOKENS" \
+        "$COST_TOTAL_USD" \
         "$steps_json"
 }
 
@@ -1227,6 +1382,8 @@ main() {
             --retry-backoff)  RETRY_BACKOFF="${2:?--retry-backoff requires seconds}"; shift ;;
             --quiet)          OUTPUT_MODE="quiet" ;;
             --json)           OUTPUT_MODE="json" ;;
+            --resume)         RESUME_MODE=true ;;
+            --pause-after-research) PAUSE_AFTER_RESEARCH=true ;;
             --skip-research)  SKIP_RESEARCH=true ;;
             --skip-implement) SKIP_IMPLEMENT=true ;;
             --skip-ux)        SKIP_UX=true ;;
@@ -1271,6 +1428,9 @@ main() {
         PIPELINE_CLEAN_EXIT=true
         return 0
     fi
+
+    # --resume: replay TIMESTAMP/BRANCH_NAME from the most recent state file
+    maybe_resume
 
     prepare_feature_branch
 
