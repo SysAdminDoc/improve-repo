@@ -233,7 +233,7 @@ run_codex_exec() {
 
 usage() {
     cat <<'EOF'
-improve-repo.sh v3.0.0 - Multi-AI repo improvement pipeline
+improve-repo.sh v3.1.0 - Multi-AI repo improvement pipeline
 
 USAGE:
     ./improve-repo.sh <repo-path> [OPTIONS]
@@ -817,7 +817,7 @@ print_summary() {
 main() {
     echo -e "${CYAN}${BOLD}"
     echo "  ╔══════════════════════════════════════════════════╗"
-    echo "  ║   Multi-AI Repo Improvement Pipeline v3.0        ║"
+    echo "  ║   Multi-AI Repo Improvement Pipeline v3.1        ║"
     echo "  ║   Claude x3 Research -> Implement -> Codex Loop  ║"
     echo "  ╚══════════════════════════════════════════════════╝"
     echo -e "${RESET}"

@@ -6,7 +6,7 @@
 
 **Automated repository improvement pipeline — research, implement, polish, review, PR.**
 
-[![Version](https://img.shields.io/badge/version-3.0.0-blue.svg)](https://github.com/SysAdminDoc/improve-repo/releases)
+[![Version](https://img.shields.io/badge/version-3.1.0-blue.svg)](https://github.com/SysAdminDoc/improve-repo/releases)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows--bash-lightgrey.svg)](#requirements)
 [![Shell](https://img.shields.io/badge/shell-bash-89e051.svg)](improve-repo.sh)
@@ -56,6 +56,10 @@ improve-repo.sh <repo-path-or-name> [OPTIONS]
 OPTIONS:
   --loops N            Number of full cycles (default: 1, max: 5)
   --research-passes N  Research depth: 1=broad, 2=+deep, 3=+internal (default: 3)
+  --timeout DURATION   Per-call ceiling for claude/codex (default: 45m)
+  --base-branch NAME   Override auto-detected base branch (main/master)
+  --remote NAME        Override push remote (default: origin)
+  --keep-logs N        Retain last N prior runs' logs (default: 10)
   --skip-research      Reuse existing ROADMAP.md
   --skip-implement     Skip implementation
   --skip-ux            Skip UX polish pass
