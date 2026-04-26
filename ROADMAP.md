@@ -96,3 +96,28 @@ All 13 P1 items shipped in six commits. Dogfooded by hand because the pipeline i
 - `--remote` override
 - Remove `--no-verify` from auto-commit
 - Bash 4+ version guard
+
+## Open-Source Research (Round 2)
+
+### Related OSS Projects
+- https://github.com/githubnext/agentic-workflows (aka `gh-aw`) — GitHub's official Agentic Workflows, Markdown-authored AI actions that run inside GitHub Actions with a network firewall (Squid proxy + explicit allowlist) and read-only token guardrail
+- https://github.github.com/gh-aw/ — the `gh aw` CLI and docs; supports Claude Code, OpenAI Codex, and Copilot as backends
+- https://github.com/warpdotdev/oz-agent-action — Warp's Oz agent, CI-triggered code review / issue triage / bug fix action with label-driven invocation (`oz-agent` label)
+- https://github.com/Codium-ai/pr-agent — PR-Agent by CodiumAI (now Qodo), the canonical "AI code reviewer" comment-bot reference
+- https://github.com/coderabbitai (CodeRabbit GitHub App) — de-facto standard async PR review bot; good reference for PR comment density and inline suggestions
+- https://github.com/topics/ai-code-review — topic hub for the adjacent reviewer-agent landscape
+
+### Features to Borrow
+- Markdown-first workflow authoring (gh-aw) — let users describe an improve-repo "mission" in `.github/workflows/improve.md` instead of shell flags, compiled to YAML on CI
+- Agent network allowlist / outbound firewall (gh-aw) — wrap the pipeline stages in a sandbox that only permits github.com, npm, PyPI, etc., mitigating supply-chain risk inside the improvement loop
+- Read-only token stage for research, write token for implement (gh-aw guardrails) — already close to how we separate research/implement; formalize the scope-escalation handoff
+- Label-driven automation (Warp Oz) — add `improve-repo:run` and `improve-repo:deferred` labels for GitHub-native triggering alongside the CLI
+- PR-style inline comments from the review pass (PR-Agent, CodeRabbit) — upgrade the review stage from a single markdown comment to per-file-per-line suggestions
+- SARIF output for GitHub Code Scanning (from GlassWorm Hunter et al.) — emit review findings as SARIF so repo owners see them under the Security tab
+- Structured exit codes (0 clean / 1 findings / 2 error) — makes the script safely gateable in upstream pipelines
+
+### Patterns & Architectures Worth Studying
+- Continuous-AI loop topology (GitHub's "continuous triage / test / docs / quality") — our pipeline is already this shape; steal their naming + cadence conventions to make the tool's purpose obvious to new users
+- Multi-agent routing (PR-Agent → CodeRabbit → Copilot Review → human) — different agents are better at different passes; improve-repo could expose `--review-backend=codium|coderabbit|claude|codex` as pluggable backends
+- Human-in-the-loop merge gate (gh-aw enforces "PRs never merge automatically") — codify this in improve-repo so even with `--yes` it can only open a draft PR, never merge
+- Markdown-to-YAML compiler step (gh-aw `gh aw compile`) — interesting pattern for keeping our ROADMAP.md both human-readable and machine-consumable by `--skip-research`
